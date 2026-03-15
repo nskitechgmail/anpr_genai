@@ -1,18 +1,16 @@
 """
 main.py — Smart City ANPR System Entry Point
 
-Usage examples:
-    python main.py                                  # GUI + webcam
-    python main.py --source traffic.mp4             # GUI + video file
-    python main.py --source rtsp://192.168.1.100/stream  # GUI + RTSP
-    python main.py --headless --source 0            # Headless mode
-    python main.py --headless --api --source 0      # Headless + REST API
-    python main.py --api-only                       # API stub (no pipeline)
-    python main.py --no-genai --source 0            # Disable Real-ESRGAN
-    python main.py --device cpu --source 0          # Force CPU mode
-    python main.py --image path/to/image.jpg        # Single image mode
+Usage:
+    python main.py                                   # GUI + webcam
+    python main.py --source traffic.mp4              # GUI + video
+    python main.py --source rtsp://192.168.1.100/... # GUI + RTSP
+    python main.py --headless --source 0             # Headless only
+    python main.py --headless --api --source 0       # Headless + REST API
+    python main.py --api-only                        # REST API stub mode
+    python main.py --no-genai --device cpu           # CPU-only (demo)
+    python main.py --image path/to/image.jpg         # Single image
 """
-
 from __future__ import annotations
 import argparse
 import logging
@@ -24,39 +22,35 @@ from pathlib import Path
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Smart City ANPR System — Multi-Modal Vehicle Detection & LPR",
+        description="Smart City ANPR — Multi-Modal Vehicle Detection & LPR",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--source",    default="0",
-                   help="Video source: 0=webcam, path to video file, or rtsp://...")
-    p.add_argument("--conf",      type=float, default=0.40,
+    p.add_argument("--source",     default="0",
+                   help="Webcam index, video path, or rtsp://...")
+    p.add_argument("--conf",       type=float, default=0.25,
                    help="YOLO detection confidence threshold")
-    p.add_argument("--device",    default="auto",
-                   choices=["auto", "cpu", "cuda", "mps"],
-                   help="Inference device")
-    p.add_argument("--output",    default="outputs",
+    p.add_argument("--device",     default="auto",
+                   choices=["auto","cpu","cuda","mps"])
+    p.add_argument("--output",     default="outputs",
                    help="Output directory for reports and violation images")
-    p.add_argument("--camera-id", default="CCTV-001",
-                   help="Camera identifier used in reports")
-    p.add_argument("--no-genai",  action="store_true",
-                   help="Disable Real-ESRGAN super-resolution enhancement")
-    p.add_argument("--no-anon",   action="store_true",
+    p.add_argument("--camera-id",  default="CCTV-001")
+    p.add_argument("--no-genai",   action="store_true",
+                   help="Disable Real-ESRGAN enhancement")
+    p.add_argument("--no-anon",    action="store_true",
                    help="Disable face anonymisation")
-    p.add_argument("--headless",  action="store_true",
-                   help="Run without GUI (console output only)")
-    p.add_argument("--api",       action="store_true",
+    p.add_argument("--headless",   action="store_true",
+                   help="Run without GUI")
+    p.add_argument("--api",        action="store_true",
                    help="Start FastAPI REST server alongside pipeline")
-    p.add_argument("--api-only",  action="store_true",
-                   help="Start REST API without a live pipeline (stub mode)")
-    p.add_argument("--api-port",  type=int, default=8000,
-                   help="REST API port")
-    p.add_argument("--heatmap",   action="store_true",
+    p.add_argument("--api-only",   action="store_true",
+                   help="REST API stub mode (no pipeline)")
+    p.add_argument("--api-port",   type=int, default=8000)
+    p.add_argument("--heatmap",    action="store_true",
                    help="Enable traffic density heatmap overlay")
-    p.add_argument("--image",     default=None,
+    p.add_argument("--image",      default=None,
                    help="Process a single image and exit")
-    p.add_argument("--log-level", default="INFO",
-                   choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-                   help="Logging verbosity")
+    p.add_argument("--log-level",  default="INFO",
+                   choices=["DEBUG","INFO","WARNING","ERROR"])
     return p
 
 
@@ -79,25 +73,24 @@ def _build_settings(args):
         anonymise_faces = not args.no_anon,
         output_dir      = args.output,
         enable_heatmap  = args.heatmap,
+        api_port        = args.api_port,
     )
 
 
 def _start_api(pipeline, settings, port: int):
-    """Start uvicorn in a daemon thread."""
     try:
         import uvicorn
         from api.server import create_app
-        app = create_app(pipeline=pipeline, settings=settings)
+        app    = create_app(pipeline=pipeline, settings=settings)
         config = uvicorn.Config(app, host="0.0.0.0", port=port,
                                 log_level="warning", access_log=False)
         server = uvicorn.Server(config)
-        t = threading.Thread(target=server.run, daemon=True)
-        t.start()
-        print(f"  ✓ REST API running at http://localhost:{port}/docs")
+        threading.Thread(target=server.run, daemon=True).start()
+        print(f"  ✓ REST API → http://localhost:{port}/docs")
         return server
     except ImportError:
         print("  ✗ uvicorn not installed — REST API disabled. "
-              "Install with: pip install 'uvicorn[standard]'")
+              "Install: pip install 'uvicorn[standard]'")
         return None
 
 
@@ -110,55 +103,61 @@ def main():
     log.info("Smart City ANPR System — SRM IST 2024-25")
     log.info(f"Python {sys.version.split()[0]} | PID {os.getpid()}")
 
-    # ── API-only stub mode ─────────────────────────────────────────────────
+    # ── API-only stub ──────────────────────────────────────────────
     if args.api_only:
         settings = _build_settings(args)
-        server   = _start_api(None, settings, args.api_port)
-        if server:
-            try:
-                import time
-                while True:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                pass
+        _start_api(None, settings, args.api_port)
+        try:
+            import time
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
         return
 
     settings = _build_settings(args)
 
-    # ── Single-image mode ──────────────────────────────────────────────────
+    # ── Single-image mode ──────────────────────────────────────────
     if args.image:
         import cv2
         from core.pipeline import ANPRPipeline
-        pipeline = ANPRPipeline(settings)
-        annotated, dets = pipeline.process_single_image(args.image)
-        out_path = Path(settings.output_dir) / "single_result.jpg"
+        pipe      = ANPRPipeline(settings)
+        annotated, dets = pipe.process_single_image(args.image)
+        out_path  = Path(settings.output_dir) / "single_result.jpg"
         cv2.imwrite(str(out_path), annotated)
-        print(f"Saved annotated image → {out_path}")
+        print(f"Saved → {out_path}")
         for d in dets:
-            plate_txt = d.plate.normalised() if d.plate else "N/A"
-            print(f"  {d.vehicle_class:12s} | plate={plate_txt:20s} | {d.violation}")
+            plate = d.plate.normalised() if d.plate else "N/A"
+            print(f"  {d.vehicle_class:12s} | plate={plate:20s} | {d.violation}")
         return
 
     from core.pipeline import ANPRPipeline
-    pipeline = ANPRPipeline(settings)
 
-    # ── Optionally start API ───────────────────────────────────────────────
-    if args.api or args.headless:
-        _start_api(pipeline, settings, args.api_port)
-
-    # ── Headless mode ──────────────────────────────────────────────────────
+    # ── Headless mode ──────────────────────────────────────────────
     if args.headless:
+        pipeline = ANPRPipeline(settings)
+        if args.api:
+            _start_api(pipeline, settings, args.api_port)
         pipeline.run_headless()
         return
 
-    # ── GUI mode ───────────────────────────────────────────────────────────
+    # ── GUI mode ───────────────────────────────────────────────────
+    # Note: ANPRDashboard(settings) — pipeline is created internally
     try:
         from ui.dashboard import ANPRDashboard
-        dashboard = ANPRDashboard(settings)
-        dashboard.run()
+        if args.api:
+            # Start API before dashboard so pipeline is wired in
+            pipeline = ANPRPipeline(settings)
+            _start_api(pipeline, settings, args.api_port)
+            # Patch dashboard to reuse our pipeline instance
+            dash = ANPRDashboard(settings)
+            dash.pipeline = pipeline
+            dash.run()
+        else:
+            ANPRDashboard(settings).run()
     except ImportError as e:
-        log.error(f"Tkinter / PIL not available: {e}. Falling back to headless mode.")
-        pipeline.run_headless()
+        log.error(f"GUI unavailable ({e}) — falling back to headless.")
+        ANPRPipeline(settings).run_headless()
 
 
 if __name__ == "__main__":
