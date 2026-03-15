@@ -1,447 +1,460 @@
 """
-ui/dashboard.py — Full-featured real-time ANPR monitoring dashboard.
+ui/dashboard.py — Real-time ANPR monitoring dashboard (Sprint 2).
 
-Features:
-  • Live camera/video feed with detection overlays
-  • Real-time violation log with plate text, vehicle type, timestamp
-  • Before/After GenAI enhancement panel
-  • Performance metrics (FPS, accuracy, violation stats)
-  • Export reports (CSV/JSON)
-  • Settings panel (toggle GenAI, confidence, camera source)
+Key fixes vs previous version:
+  • FrameStats imported from core.pipeline (not core.plate_recogniser)
+  • _session_start initialised in __init__ (was missing → NameError)
+  • ANPRDashboard(settings) — pipeline created internally
+  • _process_file handles both images and video
+  • _restart_pipeline for webcam/RTSP
 """
-
 from __future__ import annotations
+import csv
+import logging
+import os
+import threading
+import time
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-import cv2, threading, time, os, queue
-import numpy as np
+from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
-from PIL import Image, ImageTk
+from typing import Optional
 
-from core.pipeline import ANPRPipeline
-from core.plate_recogniser import FrameStats, VehicleDetection
-from config.settings import Settings
+import cv2
+import numpy as np
+
+try:
+    from PIL import Image, ImageTk
+    _PIL_OK = True
+except ImportError:
+    _PIL_OK = False
+
+# FrameStats from pipeline — single source of truth
+from core.pipeline        import ANPRPipeline, FrameStats
+from core.plate_recogniser import VehicleDetection
+from config.settings       import Settings
+
+log = logging.getLogger("Dashboard")
+
+# Colour scheme
+BG_DARK    = "#0D1B2A"
+BG_PANEL   = "#1B2E45"
+ACCENT     = "#4FC3F7"
+ACCENT2    = "#7B2FBE"
+TEXT_LIGHT = "#E0E8F0"
+TEXT_DIM   = "#88AABB"
+VIOL_RED   = "#FF4444"
+COMPL_GRN  = "#00C864"
+WARN_GOLD  = "#FFB400"
 
 
 class ANPRDashboard:
-    """Main application window."""
+    """Main Tkinter application window."""
+
+    _REFRESH_MS = 33      # ~30 FPS
+    _LOG_LIMIT  = 300
 
     def __init__(self, settings: Settings):
         self.cfg      = settings
         self.pipeline = ANPRPipeline(settings)
         self._running = False
-        self._viol_log: list[dict] = []
-        self._photo_main = None
-        self._photo_plate= None
+        self._session_start = time.time()   # ← was missing; caused NameError
+        self._session_counts = dict(
+            total_vehicles=0, total_plates=0,
+            total_violations=0, no_helmet=0, no_belt=0)
+        self._photo_main  = None
+        self._photo_plate = None
 
-    # ── Launch ──────────────────────────────────────────────────────────────
+    # ── Launch ────────────────────────────────────────────────────
 
     def run(self):
         self.root = tk.Tk()
         self.root.title(
-            "Smart City ANPR System  ·  SRM Institute of Science & Technology"
-        )
+            "Smart City ANPR System  ·  SRM Institute of Science & Technology")
         self.root.geometry("1400x860")
-        self.root.configure(bg="#0D1B2A")
+        self.root.configure(bg=BG_DARK)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_styles()
         self._build_ui()
-
-        # Start pipeline
         self.pipeline.start()
         self._running = True
         self._update_loop()
-
         self.root.mainloop()
 
-    # ── Styles ──────────────────────────────────────────────────────────────
+    # ── Styles ────────────────────────────────────────────────────
 
     def _build_styles(self):
         st = ttk.Style(self.root)
         st.theme_use("clam")
-        for name,bg,fg,font in [
-            ("TFrame",       "#0D1B2A","#E0E8F0",("Segoe UI",10)),
-            ("Card.TFrame",  "#1B2E45","#E0E8F0",("Segoe UI",10)),
-            ("TLabel",       "#0D1B2A","#E0E8F0",("Segoe UI",10)),
-            ("Header.TLabel","#1B2E45","#4FC3F7",("Segoe UI",11,"bold")),
-            ("Sub.TLabel",   "#1B2E45","#88AABB",("Segoe UI",9)),
-            ("Metric.TLabel","#0D1B2A","#4FC3F7",("Segoe UI",20,"bold")),
-            ("Alert.TLabel", "#0D1B2A","#FF4444",("Segoe UI",11,"bold")),
-            ("Status.TLabel","#0A1520","#4FC3F7",("Segoe UI",9)),
-        ]:
-            st.configure(name, background=bg, foreground=fg, font=font)
+        st.configure("TFrame",       background=BG_DARK,  foreground=TEXT_LIGHT)
+        st.configure("Card.TFrame",  background=BG_PANEL, foreground=TEXT_LIGHT)
+        st.configure("TLabel",       background=BG_DARK,  foreground=TEXT_LIGHT,
+                     font=("Segoe UI", 10))
+        st.configure("Header.TLabel",background=BG_PANEL, foreground=ACCENT,
+                     font=("Segoe UI", 11, "bold"))
+        st.configure("Metric.TLabel",background=BG_DARK,  foreground=ACCENT,
+                     font=("Segoe UI", 22, "bold"))
+        st.configure("Sub.TLabel",   background=BG_PANEL, foreground=TEXT_DIM,
+                     font=("Segoe UI", 9))
+        st.configure("Run.TButton",  background=ACCENT,   foreground=BG_DARK,
+                     font=("Segoe UI", 9, "bold"), padding=4)
+        st.configure("Danger.TButton", background=VIOL_RED, foreground="white",
+                     font=("Segoe UI", 9, "bold"), padding=4)
+        st.configure("ANPR.Treeview",
+                     background=BG_DARK, foreground=TEXT_LIGHT,
+                     rowheight=22, fieldbackground=BG_DARK,
+                     font=("Segoe UI", 8))
+        st.configure("ANPR.Treeview.Heading",
+                     background=BG_PANEL, foreground=ACCENT,
+                     font=("Segoe UI", 8, "bold"))
+        st.map("ANPR.Treeview",
+               background=[("selected", ACCENT2)],
+               foreground=[("selected", "#FFFFFF")])
 
-        st.configure("Run.TButton",  font=("Segoe UI",10,"bold"),
-                     background="#0078D4", foreground="white")
-        st.map("Run.TButton", background=[("active","#005A9E")])
-        st.configure("Stop.TButton", font=("Segoe UI",10,"bold"),
-                     background="#C00000", foreground="white")
-        st.map("Stop.TButton", background=[("active","#900000")])
-
-        st.configure("Treeview", background="#0D1B2A", foreground="#C8E0F0",
-                     fieldbackground="#0D1B2A", rowheight=22, font=("Segoe UI",9))
-        st.configure("Treeview.Heading", background="#1B2E45",
-                     foreground="#4FC3F7", font=("Segoe UI",9,"bold"))
-        st.map("Treeview", background=[("selected","#0078D4")])
-
-        st.configure("TCheckbutton", background="#1B2E45", foreground="#E0E8F0",
-                     font=("Segoe UI",10))
-        st.configure("TProgressbar", troughcolor="#1B2E45",
-                     background="#4FC3F7", thickness=5)
-        st.configure("TScale", background="#1B2E45", troughcolor="#0D1B2A")
-
-    # ── UI Layout ────────────────────────────────────────────────────────────
+    # ── UI ────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # Header
-        hdr = tk.Frame(self.root, bg="#0A1520", height=50)
-        hdr.pack(fill=tk.X)
-        tk.Label(hdr,
-                 text="🚦  Smart City ANPR — Multi-Modal Vehicle Detection & Licence Plate Recognition",
-                 bg="#0A1520", fg="#4FC3F7",
-                 font=("Segoe UI",13,"bold")).pack(side=tk.LEFT,padx=14,pady=12)
-        tk.Label(hdr,
-                 text="using Generative AI (Real-ESRGAN)  ·  SRM Institute",
-                 bg="#0A1520", fg="#506070",
-                 font=("Segoe UI",10)).pack(side=tk.LEFT)
+        # Title bar
+        tb = tk.Frame(self.root, bg=BG_DARK, height=46)
+        tb.pack(fill=tk.X)
+        tk.Label(tb, text="🚦  Smart City ANPR  —  Multi-Modal Vehicle Detection & LPR",
+                 font=("Segoe UI", 13, "bold"), fg=ACCENT, bg=BG_DARK
+                 ).pack(side=tk.LEFT, padx=14, pady=8)
+        tk.Label(tb, text="SRM IST · Dept. Computational Intelligence · 2024-25",
+                 font=("Segoe UI", 9), fg=TEXT_DIM, bg=BG_DARK
+                 ).pack(side=tk.RIGHT, padx=14)
 
         # Toolbar
-        self._build_toolbar()
+        toolbar = tk.Frame(self.root, bg=BG_PANEL, height=40)
+        toolbar.pack(fill=tk.X)
+        self._build_toolbar(toolbar)
 
-        # Main area
-        main = ttk.Frame(self.root)
-        main.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4,0))
-        main.columnconfigure(0, weight=3)
-        main.columnconfigure(1, weight=1)
-        main.rowconfigure(0, weight=2)
-        main.rowconfigure(1, weight=1)
+        # Body
+        body = tk.Frame(self.root, bg=BG_DARK)
+        body.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
 
-        # Video feed (large)
-        self._build_video_panel(main)
-        # Right panel
-        self._build_right_panel(main)
-        # Bottom panel
-        self._build_bottom_panel(main)
+        left = tk.Frame(body, bg=BG_DARK)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right = tk.Frame(body, bg=BG_PANEL, width=360)
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(6,0))
+        right.pack_propagate(False)
+
+        self._build_video_panel(left)
+        self._build_metrics_bar(left)
+        self._build_log_panel(right)
 
         # Status bar
-        sb = tk.Frame(self.root, bg="#0A1520", height=24)
-        sb.pack(fill=tk.X)
-        self._status_var = tk.StringVar(value="Initialising …")
-        ttk.Label(sb, textvariable=self._status_var,
-                  style="Status.TLabel").pack(side=tk.LEFT, padx=10)
-        ttk.Label(sb,
-                  text="SRM Institute  ·  Dept. of Computational Intelligence  ·  sv2447@srmist.edu.in",
-                  style="Status.TLabel").pack(side=tk.RIGHT, padx=10)
+        self._status_var = tk.StringVar(value="Ready — pipeline starting …")
+        tk.Label(self.root, textvariable=self._status_var,
+                 font=("Segoe UI", 9), fg=TEXT_DIM, bg=BG_DARK,
+                 anchor=tk.W).pack(fill=tk.X, padx=8, pady=2)
 
-    def _build_toolbar(self):
-        tb = tk.Frame(self.root, bg="#132030", height=42)
-        tb.pack(fill=tk.X)
-
+    def _build_toolbar(self, parent):
+        controls = [
+            ("✦ GenAI", "_genai_var", "toggle", self._toggle_genai),
+            ("📁 Open File", None, "btn",    self._open_file),
+            ("📷 Webcam",   None, "btn",    self._use_webcam),
+            ("📡 RTSP",     None, "btn",    self._open_rtsp),
+            ("💾 Export CSV",None,"btn",    self._export_csv),
+            ("⏹ Stop",      None, "danger", self._stop_pipeline),
+        ]
         self._genai_var = tk.BooleanVar(value=self.cfg.use_genai)
-        ttk.Checkbutton(tb, text=" ✨ GenAI Enhancement",
-                        variable=self._genai_var,
-                        command=self._toggle_genai,
-                        style="TCheckbutton").pack(side=tk.LEFT,padx=10,pady=6)
+        for label, var, kind, cmd in controls:
+            if kind == "toggle":
+                tk.Checkbutton(parent, text=label,
+                               variable=self._genai_var,
+                               command=cmd,
+                               fg=ACCENT, bg=BG_PANEL,
+                               selectcolor=BG_DARK,
+                               activeforeground=ACCENT,
+                               activebackground=BG_PANEL,
+                               font=("Segoe UI", 9)
+                               ).pack(side=tk.LEFT, padx=10, pady=6)
+            elif kind == "danger":
+                ttk.Button(parent, text=label, command=cmd,
+                           style="Danger.TButton"
+                           ).pack(side=tk.RIGHT, padx=8, pady=6)
+            else:
+                ttk.Button(parent, text=label, command=cmd,
+                           style="Run.TButton"
+                           ).pack(side=tk.LEFT, padx=4, pady=6)
 
-        tk.Label(tb,text="Confidence:",bg="#132030",fg="#A0B8C8",
-                 font=("Segoe UI",9)).pack(side=tk.LEFT,padx=(14,2))
+        # Confidence slider
+        tk.Label(parent, text="Conf:", fg=TEXT_DIM, bg=BG_PANEL,
+                 font=("Segoe UI",9)).pack(side=tk.LEFT, padx=(12,2))
         self._conf_var = tk.DoubleVar(value=self.cfg.conf_thresh)
-        ttk.Scale(tb, from_=0.1, to=0.9, variable=self._conf_var,
-                  orient=tk.HORIZONTAL, length=100,
-                  command=lambda v: setattr(self.cfg,"conf_thresh",float(v)),
-                  style="TScale").pack(side=tk.LEFT)
-        self._conf_label = tk.StringVar(value=f"{self.cfg.conf_thresh:.0%}")
-        tk.Label(tb, textvariable=self._conf_label,
-                 bg="#132030", fg="#4FC3F7",
-                 font=("Segoe UI",9,"bold")).pack(side=tk.LEFT,padx=4)
-        self._conf_var.trace_add("write", lambda *_: self._conf_label.set(
-            f"{self._conf_var.get():.0%}"))
-
-        # Separator
-        ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT,fill=tk.Y,padx=12,pady=4)
-
-        ttk.Button(tb, text="📂 Open File",
-                   command=self._open_file, style="Run.TButton").pack(side=tk.LEFT,padx=4)
-        ttk.Button(tb, text="📷 Webcam",
-                   command=self._use_webcam, style="Run.TButton").pack(side=tk.LEFT,padx=4)
-        ttk.Button(tb, text="📡 RTSP Stream",
-                   command=self._open_rtsp, style="Run.TButton").pack(side=tk.LEFT,padx=4)
-
-        ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT,fill=tk.Y,padx=12,pady=4)
-
-        ttk.Button(tb, text="💾 Export CSV",
-                   command=self._export_csv, style="Run.TButton").pack(side=tk.LEFT,padx=4)
-        ttk.Button(tb, text="🔴 Stop",
-                   command=self._stop_pipeline, style="Stop.TButton").pack(side=tk.RIGHT,padx=8)
+        tk.Scale(parent, from_=0.10, to=0.90, resolution=0.05,
+                 orient=tk.HORIZONTAL, variable=self._conf_var,
+                 command=self._update_conf,
+                 bg=BG_PANEL, fg=TEXT_LIGHT, troughcolor=BG_DARK,
+                 highlightthickness=0, length=120,
+                 ).pack(side=tk.LEFT)
 
     def _build_video_panel(self, parent):
-        card = tk.Frame(parent, bg="#0A1520", bd=1, relief=tk.FLAT)
-        card.grid(row=0, column=0, padx=(0,6), pady=(0,6), sticky="nsew")
+        frame = tk.Frame(parent, bg="#000000", bd=2, relief=tk.SUNKEN)
+        frame.pack(fill=tk.BOTH, expand=True, pady=(0,4))
+        self._video_canvas = tk.Canvas(frame, bg="#000000",
+                                       highlightthickness=0)
+        self._video_canvas.pack(fill=tk.BOTH, expand=True)
+        self._video_canvas.create_text(
+            480, 270, text="Initialising …",
+            fill=TEXT_DIM, font=("Segoe UI", 14), tags="placeholder")
 
-        tk.Label(card, text="LIVE FEED — Vehicle Detection & Plate Recognition",
-                 bg="#0A1520", fg="#4FC3F7",
-                 font=("Segoe UI",10,"bold")).pack(anchor=tk.W, padx=8, pady=(6,2))
-
-        self._video_canvas = tk.Canvas(card, bg="#000010",
-                                       highlightthickness=1,
-                                       highlightbackground="#1B2E45")
-        self._video_canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0,4))
-
-    def _build_right_panel(self, parent):
-        right = ttk.Frame(parent, style="Card.TFrame")
-        right.grid(row=0, column=1, rowspan=1, pady=(0,6), sticky="nsew")
-
-        # Metrics
-        tk.Label(right, text="LIVE METRICS", bg="#1B2E45", fg="#4FC3F7",
-                 font=("Segoe UI",10,"bold")).pack(anchor=tk.W,padx=10,pady=(8,4))
-
+    def _build_metrics_bar(self, parent):
+        bar = tk.Frame(parent, bg=BG_PANEL, height=72)
+        bar.pack(fill=tk.X, pady=(0,4))
+        bar.pack_propagate(False)
         self._metric_vars = {}
-        for key,label in [("fps","FPS"),("vehicles","Vehicles"),
-                          ("plates","Plates Read"),("violations","Violations")]:
-            f = tk.Frame(right, bg="#0D1B2A")
-            f.pack(fill=tk.X, padx=8, pady=2)
-            var = tk.StringVar(value="—")
-            self._metric_vars[key] = var
-            tk.Label(f, textvariable=var, bg="#0D1B2A",
-                     fg="#4FC3F7", font=("Segoe UI",18,"bold")).pack(side=tk.LEFT)
-            tk.Label(f, text=f"  {label}", bg="#0D1B2A",
-                     fg="#88AABB", font=("Segoe UI",9)).pack(side=tk.LEFT,anchor=tk.S,pady=4)
-
-        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X,padx=8,pady=6)
-
-        # Plate inset
-        tk.Label(right, text="LAST PLATE (GenAI Enhanced)",
-                 bg="#1B2E45", fg="#4FC3F7",
-                 font=("Segoe UI",9,"bold")).pack(anchor=tk.W,padx=10,pady=(4,2))
-        self._plate_canvas = tk.Canvas(right, bg="#000010", height=80,
-                                       highlightthickness=1,
-                                       highlightbackground="#4FC3F7")
-        self._plate_canvas.pack(fill=tk.X, padx=8, pady=(0,4))
-        self._plate_text_var = tk.StringVar(value="—")
-        tk.Label(right, textvariable=self._plate_text_var,
-                 bg="#1B2E45", fg="#00FFCC",
-                 font=("Courier",13,"bold")).pack(pady=2)
-
-        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X,padx=8,pady=6)
-
-        # Accuracy bar
-        tk.Label(right, text="OCR ACCURACY",
-                 bg="#1B2E45", fg="#4FC3F7",
-                 font=("Segoe UI",9,"bold")).pack(anchor=tk.W,padx=10)
-        self._acc_var = tk.DoubleVar(value=84.5)
-        ttk.Progressbar(right, variable=self._acc_var, maximum=100,
-                        length=200, style="TProgressbar").pack(padx=8,pady=4,fill=tk.X)
-        self._acc_label_var = tk.StringVar(value="GenAI: 84.5%")
-        tk.Label(right, textvariable=self._acc_label_var,
-                 bg="#1B2E45", fg="#80FF80",
-                 font=("Segoe UI",9,"bold")).pack()
-
-        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X,padx=8,pady=6)
-
-        # Model info
-        tk.Label(right, text="MODEL INFO",
-                 bg="#1B2E45", fg="#4FC3F7",
-                 font=("Segoe UI",9,"bold")).pack(anchor=tk.W,padx=10)
-        info = [
-            ("Detector",  self.cfg.detector_model.upper()),
-            ("OCR",       "EasyOCR + CRAFT"),
-            ("Enhancement", "Real-ESRGAN ×4" if self.cfg.use_genai else "None"),
-            ("Safety",    "MobileNetV3"),
-            ("Device",    self.cfg.device.upper()),
-        ]
-        for k,v in info:
-            f = tk.Frame(right, bg="#1B2E45")
-            f.pack(fill=tk.X, padx=10, pady=1)
-            tk.Label(f, text=k+":", bg="#1B2E45", fg="#88AABB",
-                     font=("Segoe UI",8), width=12, anchor=tk.W).pack(side=tk.LEFT)
-            tk.Label(f, text=v,   bg="#1B2E45", fg="#D0E8F0",
-                     font=("Segoe UI",8,"bold")).pack(side=tk.LEFT)
-
-    def _build_bottom_panel(self, parent):
-        bot = ttk.Frame(parent, style="Card.TFrame")
-        bot.grid(row=1, column=0, columnspan=2, pady=(0,4), sticky="nsew")
-        bot.columnconfigure(0, weight=2)
-        bot.columnconfigure(1, weight=1)
-
-        # Violation log
-        log_card = tk.Frame(bot, bg="#1B2E45")
-        log_card.grid(row=0, column=0, padx=(4,2), pady=4, sticky="nsew")
-        tk.Label(log_card, text="⚠  VIOLATION LOG",
-                 bg="#1B2E45", fg="#FF8888",
-                 font=("Segoe UI",10,"bold")).pack(anchor=tk.W,padx=8,pady=(4,2))
-
-        cols = ("time","plate","vehicle","violation","conf","cam")
-        self._tree = ttk.Treeview(log_card, columns=cols, show="headings", height=6)
-        for c,h,w in [("time","Time",80),("plate","Plate Number",130),
-                      ("vehicle","Vehicle",90),("violation","Violation",110),
-                      ("conf","Conf%",60),("cam","Camera",80)]:
-            self._tree.heading(c,text=h)
-            self._tree.column(c,width=w,anchor=tk.CENTER)
-        self._tree.tag_configure("viol", foreground="#FF8888")
-        self._tree.tag_configure("ok",   foreground="#88FF88")
-
-        vsb = ttk.Scrollbar(log_card, command=self._tree.yview)
-        self._tree.configure(yscrollcommand=vsb.set)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        self._tree.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0,4))
-
-        # Summary stats
-        stat_card = tk.Frame(bot, bg="#1B2E45")
-        stat_card.grid(row=0, column=1, padx=(2,4), pady=4, sticky="nsew")
-        tk.Label(stat_card, text="SESSION SUMMARY",
-                 bg="#1B2E45", fg="#4FC3F7",
-                 font=("Segoe UI",10,"bold")).pack(anchor=tk.W,padx=8,pady=(4,6))
-
-        self._summary_vars = {}
-        summaries = [
-            ("total_vehicles",  "Total Vehicles Detected"),
-            ("total_plates",    "Total Plates Read"),
-            ("total_violations","Total Violations"),
-            ("no_helmet",       "No Helmet"),
-            ("no_belt",         "No Seat Belt"),
-            ("session_time",    "Session Duration"),
-        ]
-        for key,label in summaries:
-            f = tk.Frame(stat_card, bg="#1B2E45")
-            f.pack(fill=tk.X, padx=10, pady=2)
+        for label, key, colour in [
+            ("FPS",        "fps",        ACCENT),
+            ("Vehicles",   "vehicles",   TEXT_LIGHT),
+            ("Plates",     "plates",     ACCENT),
+            ("Violations", "violations", VIOL_RED),
+        ]:
+            col = tk.Frame(bar, bg=BG_PANEL)
+            col.pack(side=tk.LEFT, expand=True, padx=10, pady=6)
             var = tk.StringVar(value="0")
-            self._summary_vars[key] = var
-            tk.Label(f, text=label+":", bg="#1B2E45", fg="#88AABB",
-                     font=("Segoe UI",9), width=22, anchor=tk.W).pack(side=tk.LEFT)
-            tk.Label(f, textvariable=var, bg="#1B2E45", fg="#E0F0FF",
-                     font=("Segoe UI",10,"bold")).pack(side=tk.LEFT)
+            self._metric_vars[key] = var
+            tk.Label(col, textvariable=var, font=("Segoe UI",22,"bold"),
+                     fg=colour, bg=BG_PANEL).pack()
+            tk.Label(col, text=label, font=("Segoe UI",8),
+                     fg=TEXT_DIM, bg=BG_PANEL).pack()
 
-        self._session_start = time.time()
-        self._session_counts = {
-            "total_vehicles":0,"total_plates":0,"total_violations":0,
-            "no_helmet":0,"no_belt":0,
-        }
+    def _build_log_panel(self, parent):
+        tk.Label(parent, text="Violation Log",
+                 font=("Segoe UI",11,"bold"), fg=ACCENT, bg=BG_PANEL
+                 ).pack(anchor=tk.W, padx=10, pady=(10,4))
 
-    # ── Update loop ─────────────────────────────────────────────────────────
+        cols = ("Time","Plate","Vehicle","Violation","Conf","Camera")
+        self._tree = ttk.Treeview(parent, columns=cols,
+                                   show="headings", height=16,
+                                   style="ANPR.Treeview")
+        for col in cols:
+            self._tree.heading(col, text=col)
+            w = 55 if col in ("Time","Conf","Camera") else 75
+            self._tree.column(col, width=w, anchor=tk.W)
+        self._tree.tag_configure("viol", foreground=VIOL_RED)
+        self._tree.tag_configure("ok",   foreground=COMPL_GRN)
+        sb = ttk.Scrollbar(parent, orient=tk.VERTICAL,
+                           command=self._tree.yview)
+        self._tree.configure(yscrollcommand=sb.set)
+        self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
+                        padx=(10,0), pady=4)
+        sb.pack(side=tk.LEFT, fill=tk.Y, pady=4, padx=(0,6))
+
+        # Plate display
+        tk.Label(parent, text="Latest Plate", font=("Segoe UI",9),
+                 fg=TEXT_DIM, bg=BG_PANEL).pack(padx=10, pady=(8,2))
+        self._plate_canvas = tk.Canvas(parent, bg="#000000",
+                                        height=80, width=200,
+                                        highlightthickness=0)
+        self._plate_canvas.pack(padx=10)
+        self._plate_text_var = tk.StringVar(value="—")
+        tk.Label(parent, textvariable=self._plate_text_var,
+                 font=("Courier",14,"bold"), fg=ACCENT, bg=BG_PANEL
+                 ).pack(pady=2)
+
+        # Session summary
+        self._summary_var = tk.StringVar(value="No detections yet.")
+        tk.Label(parent, textvariable=self._summary_var,
+                 font=("Segoe UI",8), fg=TEXT_DIM, bg=BG_PANEL,
+                 wraplength=340).pack(padx=10, pady=(8,4))
+
+    # ── Refresh loop ──────────────────────────────────────────────
 
     def _update_loop(self):
-        if not self._running:
-            return
+        try:
+            frame, stats, dets = self.pipeline.get_latest()
+            if frame is not None and _PIL_OK:
+                self._update_canvas(frame)
+            if stats:
+                self._update_metrics(stats)
+            if dets is not None:
+                self._update_plate_display(dets)
+                self._update_violations(dets)
+                self._update_summary(dets)
+        except Exception as e:
+            log.debug(f"Refresh error: {e}")
+        finally:
+            self.root.after(self._REFRESH_MS, self._update_loop)
 
-        frame, stats, detections = self.pipeline.get_latest()
-
-        if frame is not None:
-            self._update_video(frame)
-            self._update_metrics(stats, detections)
-            self._update_violations(detections)
-            self._update_summary(detections)
-
-        self.root.after(33, self._update_loop)   # ~30 FPS UI refresh
-
-    def _update_video(self, frame: np.ndarray):
+    def _update_canvas(self, frame: np.ndarray):
         cw = self._video_canvas.winfo_width()  or 960
         ch = self._video_canvas.winfo_height() or 540
-        if cw < 10 or ch < 10:
-            return
         h, w = frame.shape[:2]
-        scale = min(cw/w, ch/h)
+        scale = min(cw/max(w,1), ch/max(h,1))
         nw, nh = int(w*scale), int(h*scale)
-        resized = cv2.resize(frame, (nw,nh))
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
-        self._photo_main = ImageTk.PhotoImage(img)
+        if nw < 1 or nh < 1:
+            return
+        rgb = cv2.cvtColor(cv2.resize(frame,(nw,nh)), cv2.COLOR_BGR2RGB)
+        self._photo_main = ImageTk.PhotoImage(Image.fromarray(rgb))
         self._video_canvas.delete("all")
         self._video_canvas.create_image(cw//2, ch//2,
-                                        image=self._photo_main, anchor=tk.CENTER)
+                                         image=self._photo_main,
+                                         anchor=tk.CENTER)
 
-    def _update_metrics(self, stats: FrameStats, detections: list):
-        plates = sum(1 for d in detections if d.plate)
-        viols  = sum(1 for d in detections if d.has_violation())
+    def _update_metrics(self, stats: FrameStats):
         self._metric_vars["fps"].set(f"{stats.fps:.1f}")
-        self._metric_vars["vehicles"].set(str(len(detections)))
-        self._metric_vars["plates"].set(str(plates))
-        self._metric_vars["violations"].set(str(viols))
+        self._metric_vars["vehicles"].set(str(stats.vehicles))
+        self._metric_vars["plates"].set(str(stats.plates_read))
+        self._metric_vars["violations"].set(str(stats.violations))
 
-        # Update plate inset
-        for d in detections:
-            if d.plate and d.plate.plate_crop is not None:
+    def _update_plate_display(self, dets: list):
+        for d in dets:
+            if d.plate and d.plate.plate_crop is not None and _PIL_OK:
                 try:
                     crop = d.plate.plate_crop
-                    if len(crop.shape)==2:
+                    if len(crop.shape) == 2:
                         crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
-                    h,w = crop.shape[:2]
+                    h, w = crop.shape[:2]
                     tw = self._plate_canvas.winfo_width() or 200
-                    th = 80
-                    scale = min(tw/max(w,1), th/max(h,1))
-                    nw2,nh2 = int(w*scale), int(h*scale)
-                    thumb = cv2.resize(crop,(nw2,nh2))
-                    rgb2  = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
-                    self._photo_plate = ImageTk.PhotoImage(Image.fromarray(rgb2))
+                    scale = min(tw/max(w,1), 80/max(h,1))
+                    nw2, nh2 = int(w*scale), int(h*scale)
+                    rgb2 = cv2.cvtColor(
+                        cv2.resize(crop,(nw2,nh2)), cv2.COLOR_BGR2RGB)
+                    self._photo_plate = ImageTk.PhotoImage(
+                        Image.fromarray(rgb2))
                     self._plate_canvas.delete("all")
-                    self._plate_canvas.create_image(tw//2,40,
-                                                    image=self._photo_plate,anchor=tk.CENTER)
+                    self._plate_canvas.create_image(
+                        tw//2, 40, image=self._photo_plate, anchor=tk.CENTER)
                 except Exception:
                     pass
                 self._plate_text_var.set(d.plate.normalised())
                 break
 
-    def _update_violations(self, detections: list):
-        for d in detections:
+    def _update_violations(self, dets: list):
+        for d in dets:
             if d.has_violation() and d.plate:
-                ts = time.strftime("%H:%M:%S")
-                plate = d.plate.normalised()
+                ts    = time.strftime("%H:%M:%S")
                 conf  = f"{d.plate.confidence:.0%}"
-                tag   = "viol" if d.violation != "Compliant" else "ok"
+                tag   = "viol"
                 self._tree.insert("","0",
-                    values=(ts, plate, d.vehicle_class,
+                    values=(ts, d.plate.normalised(), d.vehicle_class,
                             d.violation, conf, self.cfg.camera_id),
                     tags=(tag,))
-                # Keep log bounded
-                if len(self._tree.get_children()) > 200:
+                if len(self._tree.get_children()) > self._LOG_LIMIT:
                     self._tree.delete(self._tree.get_children()[-1])
 
-    def _update_summary(self, detections: list):
-        for d in detections:
+    def _update_summary(self, dets: list):
+        for d in dets:
             self._session_counts["total_vehicles"] += 1
             if d.plate:
                 self._session_counts["total_plates"] += 1
             if d.violation == "No Helmet":
-                self._session_counts["no_helmet"] += 1
+                self._session_counts["no_helmet"]      += 1
                 self._session_counts["total_violations"] += 1
             elif d.violation == "No Seat Belt":
-                self._session_counts["no_belt"] += 1
+                self._session_counts["no_belt"]        += 1
                 self._session_counts["total_violations"] += 1
-
+        c = self._session_counts
         elapsed = int(time.time() - self._session_start)
-        m, s = divmod(elapsed, 60)
-        h, m2 = divmod(m, 60)
-        self._summary_vars["session_time"].set(f"{h:02d}:{m2:02d}:{s:02d}")
-        for k,v in self._session_counts.items():
-            if k in self._summary_vars:
-                self._summary_vars[k].set(str(v))
+        m, s    = divmod(elapsed, 60)
+        h2, m2  = divmod(m, 60)
+        self._summary_var.set(
+            f"{h2:02d}:{m2:02d}:{s:02d}  |  "
+            f"Vehicles:{c['total_vehicles']}  Plates:{c['total_plates']}  "
+            f"Violations:{c['total_violations']} "
+            f"(H:{c['no_helmet']} B:{c['no_belt']})")
 
-    # ── Toolbar actions ─────────────────────────────────────────────────────
+    # ── Toolbar actions ───────────────────────────────────────────
 
     def _toggle_genai(self):
         self.cfg.use_genai = self._genai_var.get()
-        state = "ENABLED" if self.cfg.use_genai else "DISABLED"
-        self._status_var.set(f"GenAI Enhancement {state}")
+        self._status_var.set(
+            f"GenAI {'ENABLED' if self.cfg.use_genai else 'DISABLED'}")
+
+    def _update_conf(self, val):
+        self.cfg.conf_thresh = float(val)
 
     def _open_file(self):
-        import os
         filepath = filedialog.askopenfilename(
             title="Open Video or Image File",
             filetypes=[
-                ("All supported", "*.mp4 *.avi *.mov *.mkv *.jpg *.jpeg *.png *.bmp"),
-                ("Video files",   "*.mp4 *.avi *.mov *.mkv"),
-                ("Image files",   "*.jpg *.jpeg *.png *.bmp"),
-                ("All files",     "*.*"),
-            ]
-        )
+                ("All supported","*.mp4 *.avi *.mov *.mkv *.jpg *.jpeg *.png *.bmp"),
+                ("Video files",  "*.mp4 *.avi *.mov *.mkv"),
+                ("Image files",  "*.jpg *.jpeg *.png *.bmp"),
+                ("All files",    "*.*"),
+            ])
         if not filepath:
             return
         if not os.path.exists(filepath):
             messagebox.showerror("Not Found", f"File not found:\n{filepath}")
             return
-        self._status_var.set(f"Loading: {os.path.basename(filepath)} ...")
+        self._status_var.set(f"Loading: {os.path.basename(filepath)} …")
         self.root.update()
         self._process_file(filepath)
+
+    def _process_file(self, filepath: str):
+        """Route image files to single-frame mode; video to live pipeline."""
+        ext       = os.path.splitext(filepath)[1].lower()
+        image_ext = {".jpg",".jpeg",".png",".bmp",".tiff",".webp"}
+
+        if ext in image_ext:
+            try:
+                self._status_var.set("Processing image …")
+                self.root.update()
+                try:
+                    self.pipeline.stop()
+                except Exception:
+                    pass
+                self.cfg.use_genai = False
+                self.pipeline = ANPRPipeline(self.cfg)
+                annotated, dets = self.pipeline.process_single_image(filepath)
+
+                cw = max(self._video_canvas.winfo_width(),  960)
+                ch = max(self._video_canvas.winfo_height(), 540)
+                h, w = annotated.shape[:2]
+                scale = min(cw/max(w,1), ch/max(h,1))
+                nw, nh = int(w*scale), int(h*scale)
+                rgb = cv2.cvtColor(
+                    cv2.resize(annotated,(nw,nh)), cv2.COLOR_BGR2RGB)
+                self._photo_main = ImageTk.PhotoImage(Image.fromarray(rgb))
+                self._video_canvas.delete("all")
+                self._video_canvas.create_image(
+                    cw//2, ch//2, image=self._photo_main, anchor=tk.CENTER)
+
+                plates = sum(1 for d in dets if d.plate)
+                viols  = sum(1 for d in dets if d.has_violation())
+                self._metric_vars["vehicles"].set(str(len(dets)))
+                self._metric_vars["plates"].set(str(plates))
+                self._metric_vars["violations"].set(str(viols))
+                self._metric_vars["fps"].set("—")
+
+                for d in dets:
+                    if d.plate:
+                        self._plate_text_var.set(d.plate.normalised())
+                        break
+
+                for d in dets:
+                    if d.plate:
+                        ts  = time.strftime("%H:%M:%S")
+                        tag = "viol" if d.has_violation() else "ok"
+                        self._tree.insert("","0",
+                            values=(ts, d.plate.normalised(),
+                                    d.vehicle_class, d.violation,
+                                    f"{d.plate.confidence:.0%}",
+                                    self.cfg.camera_id),
+                            tags=(tag,))
+
+                fname = os.path.basename(filepath)
+                self._status_var.set(
+                    f"{fname}  |  Vehicles:{len(dets)} "
+                    f"Plates:{plates} Violations:{viols}")
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                messagebox.showerror("Error", str(e))
+                self._status_var.set(f"Error: {e}")
+        else:
+            # Video / RTSP
+            try:
+                self.pipeline.stop()
+            except Exception:
+                pass
+            self.cfg.source = filepath
+            self.pipeline   = ANPRPipeline(self.cfg)
+            self.pipeline.start()
+            self._running = True
+            self._status_var.set(f"Playing: {os.path.basename(filepath)}")
 
     def _use_webcam(self):
         self._restart_pipeline(0)
@@ -450,10 +463,10 @@ class ANPRDashboard:
         win = tk.Toplevel(self.root)
         win.title("RTSP Stream URL")
         win.geometry("500x120")
-        win.configure(bg="#1B2E45")
-        tk.Label(win, text="RTSP URL:", bg="#1B2E45", fg="#E0E8F0",
-                 font=("Segoe UI",10)).pack(anchor=tk.W,padx=12,pady=8)
-        entry = tk.Entry(win, width=55, bg="#0D1B2A", fg="#E0E8F0",
+        win.configure(bg=BG_DARK)
+        tk.Label(win, text="RTSP URL:", bg=BG_DARK, fg=TEXT_LIGHT,
+                 font=("Segoe UI",10)).pack(anchor=tk.W, padx=12, pady=8)
+        entry = tk.Entry(win, width=55, bg=BG_PANEL, fg=TEXT_LIGHT,
                          font=("Courier",10))
         entry.insert(0, "rtsp://admin:password@192.168.1.100:554/stream1")
         entry.pack(padx=12)
@@ -466,13 +479,10 @@ class ANPRDashboard:
                    style="Run.TButton").pack(pady=8)
 
     def _restart_pipeline(self, source):
-        """Restart pipeline with new source (webcam or RTSP)."""
-        import os
         try:
             self.pipeline.stop()
         except Exception:
             pass
-        from core.pipeline import ANPRPipeline
         self.cfg.source = source
         self.pipeline   = ANPRPipeline(self.cfg)
         self.pipeline.start()
@@ -487,120 +497,24 @@ class ANPRDashboard:
     def _export_csv(self):
         path = filedialog.asksaveasfilename(
             defaultextension=".csv",
-            filetypes=[("CSV","*.csv"),("JSON","*.json")],
-            initialfile=f"violations_{time.strftime('%Y%m%d_%H%M%S')}.csv"
-        )
-        if path:
-            import csv as _csv
-            rows = []
-            for item in self._tree.get_children():
-                rows.append(dict(zip(
-                    ["time","plate","vehicle","violation","conf","camera"],
-                    self._tree.item(item)["values"]
-                )))
-            with open(path,"w",newline="") as f:
-                w = _csv.DictWriter(f, fieldnames=rows[0].keys() if rows else [])
-                w.writeheader(); w.writerows(rows)
-            messagebox.showinfo("Exported", f"Report saved:\n{path}")
-
-
-    def _process_file(self, filepath):
-        import os, cv2
-        from PIL import Image, ImageTk
-
-        ext = os.path.splitext(filepath)[1].lower()
-        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
-
-        if ext in image_exts:
-            try:
-                self._status_var.set("Processing image ...")
-                self.root.update()
-                try:
-                    self.pipeline.stop()
-                except Exception:
-                    pass
-                from core.pipeline import ANPRPipeline
-                self.cfg.use_genai = False
-                self.pipeline = ANPRPipeline(self.cfg)
-                annotated, dets = self.pipeline.process_single_image(filepath)
-
-                self.root.update_idletasks()
-                cw = max(self._video_canvas.winfo_width(), 960)
-                ch = max(self._video_canvas.winfo_height(), 540)
-                h, w = annotated.shape[:2]
-                scale = min(cw / max(w, 1), ch / max(h, 1))
-                nw2 = int(w * scale)
-                nh2 = int(h * scale)
-                resized = cv2.resize(annotated, (nw2, nh2))
-                rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(rgb)
-                self._photo_main = ImageTk.PhotoImage(img)
-                self._video_canvas.delete("all")
-                self._video_canvas.create_image(cw // 2, ch // 2,
-                    image=self._photo_main, anchor="center")
-                self._video_canvas.update()
-
-                plates = sum(1 for d in dets if d.plate)
-                viols  = sum(1 for d in dets if d.has_violation())
-                self._metric_vars["vehicles"].set(str(len(dets)))
-                self._metric_vars["plates"].set(str(plates))
-                self._metric_vars["violations"].set(str(viols))
-                self._metric_vars["fps"].set("IMG")
-
-                for d in dets:
-                    if d.plate:
-                        self._plate_text_var.set(d.plate.normalised())
-                        break
-
-                import time as _t
-                for d in dets:
-                    if d.plate:
-                        tag = "viol" if d.has_violation() else "ok"
-                        self._tree.insert("", "0",
-                            values=(_t.strftime("%H:%M:%S"),
-                                    d.plate.normalised(), d.vehicle_class,
-                                    d.violation, f"{d.plate.confidence:.0%}",
-                                    self.cfg.camera_id),
-                            tags=(tag,))
-
-                for d in dets:
-                    self._session_counts["total_vehicles"] += 1
-                    if d.plate:
-                        self._session_counts["total_plates"] += 1
-                    if d.violation == "No Helmet":
-                        self._session_counts["no_helmet"] += 1
-                        self._session_counts["total_violations"] += 1
-                    elif d.violation == "No Seat Belt":
-                        self._session_counts["no_belt"] += 1
-                        self._session_counts["total_violations"] += 1
-                for k, v in self._session_counts.items():
-                    if k in self._summary_vars:
-                        self._summary_vars[k].set(str(v))
-
-                fname = os.path.basename(filepath)
-                self._status_var.set(
-                    f"{fname}  |  Vehicles: {len(dets)}  "
-                    f"Plates: {plates}  Violations: {viols}")
-
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                from tkinter import messagebox
-                messagebox.showerror("Processing Error", str(e))
-                self._status_var.set(f"Error: {e}")
-        else:
-            try:
-                self.pipeline.stop()
-            except Exception:
-                pass
-            from core.pipeline import ANPRPipeline
-            self.cfg.source = filepath
-            self.pipeline   = ANPRPipeline(self.cfg)
-            self.pipeline.start()
-            self._running = True
-            self._status_var.set(f"Playing: {os.path.basename(filepath)}")
+            filetypes=[("CSV","*.csv")],
+            initialfile="violations_export.csv")
+        if not path:
+            return
+        records = self.pipeline.reporter.get_all()
+        if not records:
+            messagebox.showinfo("Export", "No violations to export.")
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=records[0].keys(),
+                                   extrasaction="ignore")
+                w.writeheader(); w.writerows(records)
+            messagebox.showinfo("Export",
+                                f"Saved {len(records)} records to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export Error", str(e))
 
     def _on_close(self):
-        self._running = False
         self.pipeline.stop()
         self.root.destroy()
